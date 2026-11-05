@@ -1,0 +1,21 @@
+server:
+  host: 127.0.0.1
+  port: 8765
+
+llm:
+  provider: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o
+  temperature: 0.2
+  timeout_seconds: 120
+  max_repair_attempts: 0 # Optional: 0-2 validation-feedback repairs, each makes another model request.
+  staged_java_generation: false # Generate Java sources first, then tests against those sources.
+  compact_generation_context: false # Omit draft documents from model context; retain structured answers.
+  # max_tokens: 4096 # Includes reasoning tokens on some local models.
+
+agent:
+  authorization_mode: ask
+  require_git_repository: true
+  auto_commit: true
+  regression_scope: affected

@@ -1,0 +1,19 @@
+[package]
+name = "codeagent"
+version = "0.1.0"
+description = "CodeAgent local software engineering assistant"
+authors = ["CodeAgent"]
+edition = "2021"
+
+[lib]
+name = "codeagent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1,0 +1,2 @@
+# 当前服务只使用 Python 标准库。
+# 后续接入 OpenAI SDK、代码解析器或 FastAPI 时在此增加固定版本。

@@ -1,0 +1,9 @@
+{
+  "name": "codeagent-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {"dev": "vite", "build": "vite build", "tauri": "tauri", "tauri:dev": "tauri dev", "tauri:build": "tauri build"},
+  "dependencies": {"@vitejs/plugin-react": "latest", "vite": "latest", "react": "latest", "react-dom": "latest"},
+  "devDependencies": {"@tauri-apps/cli": "^2.9.5"}
+}
