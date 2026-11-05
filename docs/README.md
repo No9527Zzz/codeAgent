@@ -1,5 +1,7 @@
 # 项目文档约定
 
+本工程功能总览见 [项目功能说明](project-features.md)，文末预留修订记录与下次修订草稿。以下目录约定用于 Agent 维护的目标项目交付文档。
+
 Agent 会围绕交易或微服务模块维护以下 Markdown 文档：
 
 - `requirements/product-requirements.md`：正式产品需求文档
