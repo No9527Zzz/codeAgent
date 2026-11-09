@@ -21,6 +21,7 @@ from typing import Any
 
 IGNORE_DIRS = {".git", "node_modules", "target", "build", "dist", ".venv", "venv", "__pycache__"}
 SOURCE_SUFFIXES = {".py", ".java", ".kt", ".xml", ".yml", ".yaml", ".json", ".sql", ".md"}
+MAX_CHANGE_CONTEXT_BYTES = 512 * 1024
 
 
 def now() -> str:
@@ -32,7 +33,8 @@ def run_git(project: Path, args: list[str], timeout: int = 20) -> tuple[bool, st
         result = subprocess.run(["git", "-C", str(project), *args], capture_output=True, text=True, encoding="utf-8", timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
-    return result.returncode == 0, (result.stdout or result.stderr).strip()
+    output = result.stdout or result.stderr
+    return result.returncode == 0, output if "-z" in args else output.strip()
 
 
 def _file_digest(project: Path, relative: str) -> str | None:
@@ -78,9 +80,16 @@ def _verify_git_baseline(task: dict[str, Any], files: list[str]) -> None:
 
 
 def _verify_staged_files(project: Path, expected: list[str]) -> None:
-    ok, output = run_git(project, ["diff", "--cached", "--name-only"])
-    actual = sorted(line for line in output.splitlines() if line)
-    if not ok or actual != sorted(set(expected)):
+    # Compare repository-relative, NUL-delimited paths, including files outside
+    # the selected project. Ask Git which authorized files really differ from
+    # HEAD so unchanged files and line-ending normalization do not block commits.
+    ok, output = run_git(project, ["diff", "--cached", "--name-only", "--no-relative", "--no-renames", "-z"])
+    actual = {name for name in output.split("\0") if name}
+    expected_ok, changed = (True, "")
+    if expected:
+        expected_ok, changed = run_git(project, ["--literal-pathspecs", "diff", "HEAD", "--name-only", "--no-relative", "--no-renames", "-z", "--", *expected])
+    authorized_changes = {name for name in changed.split("\0") if name}
+    if not ok or not expected_ok or actual != authorized_changes:
         raise ValueError("暂存区文件集合与 Agent 预期不一致，拒绝提交以避免混入其他修改")
 
 
@@ -97,12 +106,20 @@ def inspect_project(path_value: str) -> dict[str, Any]:
     names = {p.name for p in paths}
     java = any(p.suffix == ".java" for p in paths) or bool(names & {"pom.xml", "build.gradle", "build.gradle.kts"})
     python = any(p.suffix == ".py" for p in paths)
-    tests = [p for p in relative if "test" in p.lower() or p.endswith("Test.java")]
     modules = sorted({p.split("/")[0] for p in relative if "/" in p})[:40]
     build_tools = []
     if "pom.xml" in names: build_tools.append("Maven")
     if names & {"build.gradle", "build.gradle.kts", "gradlew"}: build_tools.append("Gradle")
     if "pytest.ini" in names or "pyproject.toml" in names or "setup.cfg" in names: build_tools.append("pytest 配置")
+    # Match executable unit-test files, not reports, resources or helper modules.
+    if set(build_tools) & {"Maven", "Gradle"}:
+        tests = [name for name in relative
+                 if "/src/test/java/" in "/" + name and name.endswith(".java")
+                 and (Path(name).stem.startswith("Test") or Path(name).stem.endswith(("Test", "Tests", "TestCase")))]
+    else:
+        tests = [name for name in relative
+                 if Path(name).parts[0] != "docs" and name.endswith(".py")
+                 and (Path(name).name.startswith("test_") or Path(name).name.endswith("_test.py"))]
     git_ok, _ = run_git(project, ["rev-parse", "--is-inside-work-tree"])
     _, branch = run_git(project, ["branch", "--show-current"])
     _, status = run_git(project, ["status", "--short"])
@@ -125,6 +142,30 @@ def _read_samples(project: Path, files: list[str]) -> str:
             continue
         chunks.append(f"\n### {name}\n{text[:5000]}")
     return "".join(chunks)
+
+
+def _read_change_context(project: Path, files: list[str]) -> str:
+    """Read all authorized files in full, or reject before contacting the model."""
+    project = project.resolve()
+    sources = []
+    total_bytes = 0
+    for name in dict.fromkeys(files):
+        path = (project / name).resolve()
+        if project not in path.parents or ".git" in path.relative_to(project).parts:
+            raise ValueError(f"代码上下文路径越界：{name}")
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(MAX_CHANGE_CONTEXT_BYTES + 1)
+            total_bytes += len(raw)
+            if total_bytes > MAX_CHANGE_CONTEXT_BYTES:
+                raise ValueError("完整代码上下文超过 512 KiB，请拆分任务或缩小影响范围；不会截断源码")
+            sources.append({"path": name, "content": raw.decode("utf-8")})
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f"无法完整读取代码文件 {name}：{exc}") from exc
+    context = json.dumps(sources, ensure_ascii=False)
+    if len(context.encode("utf-8")) > MAX_CHANGE_CONTEXT_BYTES:
+        raise ValueError("完整代码上下文超过 512 KiB，请拆分任务或缩小影响范围；不会截断源码")
+    return context
 
 
 def _local_documents(analysis: dict[str, Any]) -> dict[str, str]:
@@ -163,8 +204,11 @@ def analyze_task(path_value: str, config: dict[str, Any]) -> dict[str, Any]:
     analysis = inspect_project(path_value)
     if not analysis["git"]["is_repository"]:
         raise ValueError("项目必须是 Git 仓库，才能建立文档基线并强制提交")
+    project = Path(analysis["path"])
+    paths = _document_paths(project, _local_documents(analysis))
+    baseline = _capture_git_baseline(project, paths)
     documents, generator = generate_documents(analysis, config)
-    return {"id": f"TASK-{uuid.uuid4().hex[:8].upper()}", "title": f"{analysis['name']} 文档基线", "status": "awaiting_confirmation", "created_at": now(), "analysis": analysis, "documents": documents, "generator": generator}
+    return {"id": f"TASK-{uuid.uuid4().hex[:8].upper()}", "title": f"{analysis['name']} 文档基线", "status": "awaiting_confirmation", "created_at": now(), "analysis": analysis, "documents": documents, "generator": generator, "git_baseline": baseline}
 
 
 def _impact_files(analysis: dict[str, Any], request: str) -> tuple[list[str], list[str]]:
@@ -398,19 +442,24 @@ def draft_code_change(task: dict[str, Any], config: dict[str, Any]) -> dict[str,
     draft: dict[str, Any] = {"files": [], "generator": "manual-required", "note": "未配置 GPT，CodeAgent 不会猜测业务代码。请配置模型后重新生成修改草案。"}
     if api_key:
         project = Path(analysis["path"])
-        samples = _read_samples(project, task["affected_files"] + task["affected_tests"])
-        prompt = f"""根据以下已批准的变更计划修改代码。只返回合法 JSON，格式为 {{\"files\":[{{\"path\":\"项目相对路径\",\"content\":\"修改后的完整文件内容\"}}]}}。只能修改这些候选文件：{json.dumps(task['affected_files'] + task['affected_tests'], ensure_ascii=False)}。需求：{task['request']}\n\n代码样本：{samples}"""
-        payload = {"model": llm.get("model", "gpt-4o"), "temperature": float(llm.get("temperature", 0.1)), "messages": [{"role": "system", "content": "你是谨慎的软件工程师，只输出 JSON。"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
-        request = urllib.request.Request(f"{llm.get('base_url', 'https://api.openai.com/v1').rstrip('/')}/chat/completions", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
         try:
+            _verify_git_baseline(task, task["affected_files"] + task["affected_tests"])
+            context = _read_change_context(project, task["affected_files"] + task["affected_tests"])
+            prompt = f"""根据以下已批准的变更计划修改代码。只返回合法 JSON，格式为 {{\"files\":[{{\"path\":\"项目相对路径\",\"content\":\"修改后的完整文件内容\"}}]}}。只能修改这些候选文件：{json.dumps(task['affected_files'] + task['affected_tests'], ensure_ascii=False)}。需求：{task['request']}。下方包含所有候选文件的完整原文。保留与需求无关的代码，不得用省略号或片段代替完整文件。\n\n完整代码上下文（JSON）：{context}"""
+            payload = {"model": llm.get("model", "gpt-4o"), "temperature": float(llm.get("temperature", 0.1)), "messages": [{"role": "system", "content": "你是谨慎的软件工程师，只输出 JSON。"}, {"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+            request = urllib.request.Request(f"{llm.get('base_url', 'https://api.openai.com/v1').rstrip('/')}/chat/completions", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(request, timeout=int(llm.get("timeout_seconds", 120))) as response:
-                parsed = json.loads(json.loads(response.read().decode())["choices"][0]["message"]["content"])
+                envelope = json.loads(response.read().decode())
+            choice = envelope["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise ValueError("模型输出被 token 上限截断，请拆分任务或调整模型配置")
+            parsed = json.loads(choice["message"]["content"])
             allowed = set(task["affected_files"] + task["affected_tests"])
-            files = parsed.get("files", [])
-            if not files or any(not isinstance(item, dict) or item.get("path") not in allowed or not isinstance(item.get("content"), str) for item in files):
+            files = parsed.get("files", []) if isinstance(parsed, dict) else None
+            if not isinstance(files, list) or not files or any(not isinstance(item, dict) or item.get("path") not in allowed or not isinstance(item.get("content"), str) for item in files):
                 raise ValueError("模型返回了越界路径或无效文件内容")
             draft = {"files": files, "generator": "gpt", "note": "模型生成的完整文件草案，等待用户授权写入。"}
-        except (urllib.error.URLError, TimeoutError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError) as exc:
             draft["note"] = f"模型草案生成失败，未修改任何文件：{exc}"
     task["code_draft"] = draft
     if draft["files"]:
@@ -533,11 +582,25 @@ def _finish_code_change(task: dict[str, Any], project: Path, written: list[str])
     return task
 
 
+def _document_paths(project: Path, documents: dict[str, str]) -> list[str]:
+    paths = ["docs/" + name for name in documents] + ["docs/changes/change-log.md"]
+    for name in paths:
+        relative = Path(name)
+        target = (project / relative).resolve()
+        if ".." in relative.parts or ".git" in relative.parts or project.resolve() not in target.parents:
+            raise ValueError("文档路径越界，拒绝写入")
+    return paths
+
+
 def confirm_task(task: dict[str, Any]) -> dict[str, Any]:
     if task.get("status") != "awaiting_confirmation":
         raise ValueError("当前任务阶段不允许再次写入文档")
     project = Path(task["analysis"]["path"])
     if not project.is_dir(): raise ValueError("项目路径已不存在")
+    paths = _document_paths(project, task["documents"])
+    if not set(paths).issubset(task.get("git_baseline", {}).get("files", {})):
+        raise ValueError("文档任务缺少完整安全基线，请重新分析项目")
+    _verify_git_baseline(task, paths)
     written: list[str] = []
     for relative, content in task["documents"].items():
         target = project / "docs" / relative
@@ -551,6 +614,7 @@ def confirm_task(task: dict[str, Any]) -> dict[str, Any]:
     written.append("docs/changes/change-log.md")
     ok, output = run_git(project, ["add", *written])
     if not ok: raise ValueError(f"Git add 失败：{output}")
+    _verify_staged_files(project, written)
     ok, commit = run_git(project, ["commit", "-m", f"docs({project.name}): establish documentation baseline"])
     if not ok: raise ValueError(f"Git commit 失败：{commit}")
     task["status"] = "completed"; task["completed_at"] = now(); task["commit"] = commit; task["written_files"] = written

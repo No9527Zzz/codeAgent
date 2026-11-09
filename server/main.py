@@ -51,19 +51,39 @@ def publish_event(task_id: str, event_type: str, message: str, payload: dict[str
         subscriber.put(event)
 
 
+def _strip_yaml_comment(raw: str) -> str:
+    """Strip comments outside quoted scalars in our two-level config format."""
+    quote = None
+    escaped = False
+    for index, char in enumerate(raw):
+        if escaped:
+            escaped = False
+        elif quote == '"' and char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == "#" and (index == 0 or raw[index - 1].isspace()):
+            return raw[:index]
+    return raw
+
+
 def parse_simple_yaml(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {}
     section: dict[str, Any] | None = None
     if not path.exists(): return result
     for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
+        line = _strip_yaml_comment(raw).strip()
         if not line or line.startswith("#"): continue
         if not raw.startswith(" ") and line.endswith(":"):
             section = {}; result[line[:-1]] = section; continue
         if section is not None and ":" in line:
             key, value = (part.strip() for part in line.split(":", 1))
-            value = value.strip('"\'')
-            if value.lower() in {"true", "false"}: value = value.lower() == "true"
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = json.loads(value) if value[0] == '"' else value[1:-1].replace("''", "'")
+            elif value.lower() in {"true", "false"}: value = value.lower() == "true"
             else:
                 try: value = float(value) if "." in value else int(value)
                 except ValueError: pass
